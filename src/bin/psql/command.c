@@ -61,7 +61,9 @@ static bool do_edit(const char *filename_arg, PQExpBuffer query_buf,
 static bool do_connect(char *dbname, char *user, char *host, char *port);
 static bool do_shell(const char *command);
 static bool lookup_function_oid(PGconn *conn, const char *desc, Oid *foid);
+static bool lookup_view_oid(PGconn *conn, const char *desc, Oid *foid);
 static bool get_create_function_cmd(PGconn *conn, Oid oid, PQExpBuffer buf);
+static bool get_create_view_cmd(PGconn *conn, const char *desc, PQExpBuffer buf);
 static int	strip_lineno_from_funcdesc(char *func);
 static void minimal_error_message(PGresult *res);
 
@@ -563,6 +565,101 @@ exec_command(const char *cmd,
 				free(ln);
 		}
 	}
+	/*
+	 * \ev -- edit a view, or present a blank CREATE VIEW
+	 * template if no argument is given
+	 */
+	else if (strcmp(cmd, "ev") == 0)
+	{
+		int			lineno = -1;
+
+		if (pset.sversion < 80400)
+		{
+			psql_error("The server (version %d.%d) does not support editing view source.\n",
+					   pset.sversion / 10000, (pset.sversion / 100) % 100);
+			status = PSQL_CMD_ERROR;
+		}
+		else if (!query_buf)
+		{
+			psql_error("no query buffer\n");
+			status = PSQL_CMD_ERROR;
+		}
+		else
+		{
+			char	   *func;
+			Oid			foid = InvalidOid;
+
+			func = psql_scan_slash_option(scan_state,
+										  OT_WHOLE_LINE, NULL, true);
+            /*
+			lineno = strip_lineno_from_funcdesc(func);
+            
+			if (lineno == 0)
+			{
+				status = PSQL_CMD_ERROR;
+			}
+			else 
+            */
+            if (!func)
+			{
+				/* set up an empty command to fill in */
+				printfPQExpBuffer(query_buf,
+								  "CREATE VIEW \n"
+								  " AS \n"
+								  );
+			}
+			else if (!lookup_view_oid(pset.db, func, &foid))
+			{
+				/* error already reported */
+				status = PSQL_CMD_ERROR;
+			}
+			else if (!get_create_view_cmd(pset.db, func, query_buf))
+			{
+				/* error already reported */
+				status = PSQL_CMD_ERROR;
+			}
+            /*
+			else if (lineno > 0)
+			{
+				 * lineno "1" should correspond to the first line of the
+				 * function body.  We expect that pg_get_functiondef() will
+				 * emit that on a line beginning with "AS ", and that there
+				 * can be no such line before the real start of the function
+				 * body.  Increment lineno by the number of lines before that
+				 * line, so that it becomes relative to the first line of the
+				 * function definition.
+                 *
+				const char *lines = query_buf->data;
+
+				while (*lines != '\0')
+				{
+					if (strncmp(lines, "AS ", 3) == 0)
+						break;
+					lineno++;
+					lines = strchr(lines, '\n');
+					if (!lines)
+						break;
+					lines++;
+				}
+			}
+        */
+			if (func)
+				free(func);
+		}
+
+		if (status != PSQL_CMD_ERROR)
+		{
+			bool		edited = false;
+
+			if (!do_edit(NULL, query_buf, lineno, &edited))
+				status = PSQL_CMD_ERROR;
+			else if (!edited)
+				puts(_("No changes"));
+			else
+				status = PSQL_CMD_NEWEDIT;
+		}
+	}
+
 
 	/*
 	 * \ef -- edit the named function, or present a blank CREATE FUNCTION
@@ -1170,7 +1267,7 @@ exec_command(const char *cmd,
 			psql_error("function name is required\n");
 			status = PSQL_CMD_ERROR;
 		}
-		else if (!lookup_function_oid(pset.db, func, &foid))
+		else if (!lookup_view_oid(pset.db, func, &foid))
 		{
 			/* error already reported */
 			status = PSQL_CMD_ERROR;
@@ -2533,6 +2630,36 @@ lookup_function_oid(PGconn *conn, const char *desc, Oid *foid)
 	return result;
 }
 
+static bool
+lookup_view_oid(PGconn *conn, const char *desc, Oid *foid)
+{
+	bool		result = true;
+	PQExpBuffer query;
+	PGresult   *res;
+
+	query = createPQExpBuffer();
+	printfPQExpBuffer(query, "SELECT ");
+	appendStringLiteralConn(query, desc, conn);
+	appendPQExpBuffer(query, "::pg_catalog.regclass::pg_catalog.oid");
+//					  strchr(desc, '(') ? "regprocedure" : "regproc");
+
+	res = PQexec(conn, query->data);
+	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+		*foid = atooid(PQgetvalue(res, 0, 0));
+	else
+	{
+		minimal_error_message(res);
+		result = false;
+	}
+
+	PQclear(res);
+	destroyPQExpBuffer(query);
+
+	return result;
+}
+
+
+
 /*
  * Fetches the "CREATE OR REPLACE FUNCTION ..." command that describes the
  * function with the given OID.  If successful, the result is stored in buf.
@@ -2564,6 +2691,37 @@ get_create_function_cmd(PGconn *conn, Oid oid, PQExpBuffer buf)
 
 	return result;
 }
+
+static bool
+get_create_view_cmd(PGconn *conn, const char *desc, PQExpBuffer buf)
+{
+	bool		result = true;
+	PQExpBuffer query;
+	PGresult   *res;
+
+	query = createPQExpBuffer();
+	printfPQExpBuffer(query, "SELECT pg_catalog.pg_get_viewdef('%s'::pg_catalog.regclass::pg_catalog.oid, true)", desc);
+
+	res = PQexec(conn, query->data);
+	if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) == 1)
+	{
+		resetPQExpBuffer(buf);
+        printfPQExpBuffer(buf, "CREATE OR REPLACE VIEW %s AS\n", desc);
+		appendPQExpBufferStr(buf, PQgetvalue(res, 0, 0));
+	}
+	else
+	{
+		minimal_error_message(res);
+		result = false;
+	}
+
+	PQclear(res);
+	destroyPQExpBuffer(query);
+
+	return result;
+}
+
+
 
 /*
  * If the given argument of \ef ends with a line number, delete the line
